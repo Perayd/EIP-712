@@ -1,0 +1,690 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+/*
+  Monolithic Solidity Suite — many components in one file.
+  - Utilities: SafeMath-like checks (Solidity 0.8 has overflow checks), ReentrancyGuard, Pausable, Ownable, Roles
+  - ERC20 token with EIP-2612-like permit (simplified)
+  - ERC721 (simplified)
+  - Liquidity pool (constant product AMM, swap, add/remove liquidity)
+  - Staking contract with rewards distribution
+  - Vesting contract
+  - Timelock contract
+  - Multisig wallet (very simple)
+  - DAO: proposal, voting, execution
+  - Merkle Airdrop claimer
+  - Simple Lending Pool (collateralized loans, interest accrual)
+  - On-chain RNG (not secure)
+  - EIP-712 helper functions
+  Many comments included.
+*/
+
+/* -------------------------------------------------------------------------
+   Basic Utilities and Interfaces
+   ------------------------------------------------------------------------- */
+
+interface IERC20Minimal {
+    function totalSupply() external view returns (uint256);
+    function balanceOf(address a) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function allowance(address owner, address spender) external view returns (uint256);
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+}
+
+interface IERC721Minimal {
+    function ownerOf(uint256 tokenId) external view returns (address);
+    function safeTransferFrom(address from, address to, uint256 tokenId) external;
+}
+
+/* -------------------------------------------------------------------------
+   Reentrancy guard + Pausable + Ownable + Roles
+   ------------------------------------------------------------------------- */
+
+abstract contract ReentrancyGuard {
+    uint256 private _status;
+    constructor() { _status = 1; } // 1 = not entered, 2 = entered
+    modifier nonReentrant() {
+        require(_status == 1, "ReentrancyGuard: reentrant call");
+        _status = 2;
+        _;
+        _status = 1;
+    }
+}
+
+abstract contract Pausable {
+    bool private _paused;
+    event Paused(address indexed account);
+    event Unpaused(address indexed account);
+
+    constructor() { _paused = false; }
+
+    modifier whenNotPaused() {
+        require(!_paused, "Pausable: paused");
+        _;
+    }
+    modifier whenPaused() {
+        require(_paused, "Pausable: not paused");
+        _;
+    }
+    function _pause() internal whenNotPaused {
+        _paused = true;
+        emit Paused(msg.sender);
+    }
+    function _unpause() internal whenPaused {
+        _paused = false;
+        emit Unpaused(msg.sender);
+    }
+    function paused() public view returns (bool) {
+        return _paused;
+    }
+}
+
+abstract contract Ownable {
+    address public owner;
+    event OwnershipTransferred(address indexed oldOwner, address indexed newOwner);
+    constructor() { owner = msg.sender; }
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Ownable: not owner");
+        _;
+    }
+    function transferOwnership(address newOwner) public onlyOwner {
+        require(newOwner != address(0), "Ownable: zero");
+        emit OwnershipTransferred(owner, newOwner);
+        owner = newOwner;
+    }
+}
+
+/* -------------------------------------------------------------------------
+   EIP-712 helper (simplified)
+   ------------------------------------------------------------------------- */
+
+library EIP712 {
+    struct Domain {
+        bytes32 name;
+        bytes32 version;
+        uint256 chainId;
+        address verifyingContract;
+    }
+    function hashDomain(Domain memory d) internal pure returns (bytes32) {
+        // keccak256(abi.encode(...)) — simple domain hash
+        return keccak256(abi.encode(
+            keccak256("EIP712Domain(bytes32 name,bytes32 version,uint256 chainId,address verifyingContract)"),
+            d.name,
+            d.version,
+            d.chainId,
+            d.verifyingContract
+        ));
+    }
+    function toTypedMessageHash(bytes32 domainSeparator, bytes32 structHash) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+    }
+}
+
+/* -------------------------------------------------------------------------
+   Simple ERC20 with permit (EIP-2612-like, but simplified)
+   ------------------------------------------------------------------------- */
+
+contract LongERC20 is IERC20Minimal, Ownable {
+    string public name;
+    string public symbol;
+    uint8 public decimals = 18;
+    uint256 private _totalSupply;
+
+    mapping(address => uint256) private _balances;
+    mapping(address => mapping(address => uint256)) private _allowances;
+
+    // permit state
+    mapping(address => uint256) public nonces;
+    bytes32 public DOMAIN_SEPARATOR;
+    bytes32 public constant PERMIT_TYPEHASH = keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
+
+    event Mint(address indexed to, uint256 amount);
+    event Burn(address indexed from, uint256 amount);
+
+    constructor(string memory _name, string memory _symbol, uint256 initialSupply) {
+        name = _name;
+        symbol = _symbol;
+        _mint(msg.sender, initialSupply);
+        uint256 chainId;
+        assembly { chainId := chainid() }
+        DOMAIN_SEPARATOR = EIP712.hashDomain(EIP712.Domain({
+            name: keccak256(bytes(_name)),
+            version: keccak256(bytes("1")),
+            chainId: chainId,
+            verifyingContract: address(this)
+        }));
+    }
+
+    function totalSupply() external view override returns (uint256) { return _totalSupply; }
+    function balanceOf(address a) external view override returns (uint256) { return _balances[a]; }
+    function allowance(address owner_, address spender) public view override returns (uint256) { return _allowances[owner_][spender]; }
+
+    function transfer(address to, uint256 amount) external override returns (bool) {
+        _transfer(msg.sender, to, amount);
+        return true;
+    }
+    function approve(address spender, uint256 amount) external override returns (bool) {
+        _approve(msg.sender, spender, amount);
+        return true;
+    }
+    function transferFrom(address from, address to, uint256 amount) external override returns (bool) {
+        uint256 allowed = _allowances[from][msg.sender];
+        if (allowed != type(uint256).max) {
+            require(allowed >= amount, "ERC20: allowance");
+            _allowances[from][msg.sender] = allowed - amount;
+        }
+        _transfer(from, to, amount);
+        return true;
+    }
+
+    function _transfer(address a, address b, uint256 amt) internal {
+        require(b != address(0), "ERC20: zero");
+        require(_balances[a] >= amt, "ERC20: balance");
+        _balances[a] -= amt;
+        _balances[b] += amt;
+        emit Transfer(a, b, amt);
+    }
+    function _mint(address to, uint256 amt) public onlyOwner {
+        require(to != address(0), "ERC20: mint zero");
+        _totalSupply += amt;
+        _balances[to] += amt;
+        emit Transfer(address(0), to, amt);
+        emit Mint(to, amt);
+    }
+    function _burn(address from, uint256 amt) public onlyOwner {
+        require(_balances[from] >= amt, "ERC20: burn");
+        _balances[from] -= amt;
+        _totalSupply -= amt;
+        emit Transfer(from, address(0), amt);
+        emit Burn(from, amt);
+    }
+    function _approve(address owner_, address spender, uint256 amount) internal {
+        _allowances[owner_][spender] = amount;
+        emit Approval(owner_, spender, amount);
+    }
+
+    // simplified permit using EIP-712 style; does NOT use ECDSA library — uses ecrecover
+    function permit(address owner_, address spender, uint256 value, uint256 deadline, uint8 v, bytes32 r, bytes32 s) external {
+        require(block.timestamp <= deadline, "Permit: expired");
+        bytes32 structHash = keccak256(abi.encode(PERMIT_TYPEHASH, owner_, spender, value, nonces[owner_]++, deadline));
+        bytes32 digest = EIP712.toTypedMessageHash(DOMAIN_SEPARATOR, structHash);
+        address signer = ecrecover(digest, v, r, s);
+        require(signer == owner_, "Permit: invalid signature");
+        _approve(owner_, spender, value);
+    }
+}
+
+/* -------------------------------------------------------------------------
+   Simplified ERC721 (very basic)
+   ------------------------------------------------------------------------- */
+
+contract LongERC721 {
+    string public name;
+    string public symbol;
+    uint256 public totalSupply;
+
+    mapping(uint256 => address) private _owners;
+    mapping(address => uint256) private _balances;
+    mapping(uint256 => address) private _tokenApprovals;
+    mapping(address => mapping(address => bool)) private _operatorApprovals;
+
+    event Transfer(address indexed from, address indexed to, uint256 tokenId);
+    event Approval(address indexed owner, address indexed approved, uint256 tokenId);
+
+    constructor(string memory _name, string memory _symbol) {
+        name = _name;
+        symbol = _symbol;
+    }
+
+    function ownerOf(uint256 tokenId) public view returns (address) {
+        address o = _owners[tokenId];
+        require(o != address(0), "ERC721: nonexistent");
+        return o;
+    }
+    function balanceOf(address owner) public view returns (uint256) {
+        require(owner != address(0), "ERC721: zero");
+        return _balances[owner];
+    }
+    function _mint(address to, uint256 tokenId) internal {
+        require(to != address(0), "ERC721: mint zero");
+        require(_owners[tokenId] == address(0), "ERC721: exists");
+        _owners[tokenId] = to;
+        _balances[to] += 1;
+        totalSupply += 1;
+        emit Transfer(address(0), to, tokenId);
+    }
+    function _burn(uint256 tokenId) internal {
+        address owner = ownerOf(tokenId);
+        delete _owners[tokenId];
+        _balances[owner] -= 1;
+        totalSupply -= 1;
+        emit Transfer(owner, address(0), tokenId);
+    }
+    function _transfer(address from, address to, uint256 tokenId) internal {
+        require(ownerOf(tokenId) == from, "ERC721: not owner");
+        require(to != address(0), "ERC721: zero");
+        delete _tokenApprovals[tokenId];
+        _owners[tokenId] = to;
+        _balances[from] -= 1;
+        _balances[to] += 1;
+        emit Transfer(from, to, tokenId);
+    }
+    // simplified safeTransfer (no ERC721Receiver checks) for brevity:
+    function safeTransferFrom(address from, address to, uint256 tokenId) external {
+        require(msg.sender == from || msg.sender == _tokenApprovals[tokenId] || _operatorApprovals[from][msg.sender], "ERC721: not approved");
+        _transfer(from, to, tokenId);
+    }
+}
+
+/* -------------------------------------------------------------------------
+   Simple constant-product AMM (pair) — supports one ERC20 token <-> ETH pool
+   - Liquidity token is an internal accounting token (LP shares)
+   ------------------------------------------------------------------------- */
+
+contract SimpleAMM is ReentrancyGuard, Ownable {
+    IERC20Minimal public token; // ERC20 token address
+    uint256 public reserveToken;
+    uint256 public reserveETH;
+    mapping(address => uint256) public lpBalance;
+    uint256 public totalLP;
+
+    event AddLiquidity(address indexed provider, uint256 tokenIn, uint256 ethIn, uint256 lpMinted);
+    event RemoveLiquidity(address indexed provider, uint256 tokenOut, uint256 ethOut, uint256 lpBurned);
+    event SwapTokenForETH(address indexed user, uint256 tokenIn, uint256 ethOut);
+    event SwapETHForToken(address indexed user, uint256 ethIn, uint256 tokenOut);
+
+    constructor(address tokenAddress) {
+        token = IERC20Minimal(tokenAddress);
+    }
+
+    // add liquidity: caller must approve tokens to this contract before calling
+    function addLiquidity(uint256 tokenAmount) external payable nonReentrant returns (uint256 lpMinted) {
+        require(msg.value > 0 && tokenAmount > 0, "AMM: zero");
+        // transfer tokens in
+        require(token.transferFrom(msg.sender, address(this), tokenAmount), "AMM: token transfer failed");
+        // compute LP minted
+        if (totalLP == 0) {
+            lpMinted = sqrt(msg.value * tokenAmount);
+        } else {
+            // preserve proportions — smallest ratio defines minted LP
+            uint256 lpFromETH = (msg.value * totalLP) / reserveETH;
+            uint256 lpFromToken = (tokenAmount * totalLP) / reserveToken;
+            lpMinted = lpFromETH < lpFromToken ? lpFromETH : lpFromToken;
+        }
+        require(lpMinted > 0, "AMM: no LP");
+        lpBalance[msg.sender] += lpMinted;
+        totalLP += lpMinted;
+        reserveETH += msg.value;
+        reserveToken += tokenAmount;
+        emit AddLiquidity(msg.sender, tokenAmount, msg.value, lpMinted);
+    }
+
+    function removeLiquidity(uint256 lpAmount) external nonReentrant returns (uint256 tokenOut, uint256 ethOut) {
+        require(lpBalance[msg.sender] >= lpAmount && lpAmount > 0, "AMM: insufficient LP");
+        tokenOut = (reserveToken * lpAmount) / totalLP;
+        ethOut = (reserveETH * lpAmount) / totalLP;
+        require(token.transfer(msg.sender, tokenOut), "AMM: token send failed");
+        (bool sent, ) = msg.sender.call{value: ethOut}("");
+        require(sent, "AMM: ETH send failed");
+        lpBalance[msg.sender] -= lpAmount;
+        totalLP -= lpAmount;
+        reserveToken -= tokenOut;
+        reserveETH -= ethOut;
+        emit RemoveLiquidity(msg.sender, tokenOut, ethOut, lpAmount);
+    }
+
+    // swap token -> ETH, charges a 0.3% fee that stays in pool
+    function swapTokenForETH(uint256 tokenIn, uint256 minEthOut) external nonReentrant returns (uint256 ethOut) {
+        require(tokenIn > 0, "AMM: zero");
+        require(token.transferFrom(msg.sender, address(this), tokenIn), "AMM: token transfer failed");
+        uint256 tokenInWithFee = (tokenIn * 997) / 1000;
+        // x * y = k -> ethOut = reserveETH - k/(reserveToken + tokenInWithFee)
+        uint256 newTokenReserve = reserveToken + tokenInWithFee;
+        uint256 newEthReserve = (reserveToken * reserveETH) / newTokenReserve;
+        ethOut = reserveETH - newEthReserve;
+        require(ethOut >= minEthOut, "AMM: slippage");
+        (bool sent, ) = msg.sender.call{value: ethOut}("");
+        require(sent, "AMM: ETH send");
+        // update reserves: note fees remain
+        reserveToken += tokenIn;
+        reserveETH -= ethOut;
+        emit SwapTokenForETH(msg.sender, tokenIn, ethOut);
+    }
+
+    // swap ETH -> token
+    function swapETHForToken(uint256 minTokenOut) external payable nonReentrant returns (uint256 tokenOut) {
+        require(msg.value > 0, "AMM: zero ETH");
+        uint256 ethIn = msg.value;
+        uint256 ethInWithFee = (ethIn * 997) / 1000;
+        uint256 newEthReserve = reserveETH + ethInWithFee;
+        uint256 newTokenReserve = (reserveToken * reserveETH) / newEthReserve;
+        tokenOut = reserveToken - newTokenReserve;
+        require(tokenOut >= minTokenOut, "AMM: slippage");
+        require(token.transfer(msg.sender, tokenOut), "AMM: token send");
+        reserveETH += ethIn;
+        reserveToken -= tokenOut;
+        emit SwapETHForToken(msg.sender, ethIn, tokenOut);
+    }
+
+    // emergency sync (owner)
+    function sync() external onlyOwner {
+        reserveToken = token.balanceOf(address(this));
+        reserveETH = address(this).balance;
+    }
+
+    // helpers
+    function sqrt(uint y) internal pure returns (uint z) {
+        if (y == 0) return 0;
+        uint x = y / 2 + 1;
+        z = y;
+        while (x < z) {
+            z = x;
+            x = (y / x + x) / 2;
+        }
+    }
+
+    // to receive ETH
+    receive() external payable {}
+}
+
+/* -------------------------------------------------------------------------
+   Staking contract with rewards distribution (simple)
+   - Users stake ERC20 token to earn reward tokens (another ERC20)
+   - Uses rewardPerToken accounting
+   ------------------------------------------------------------------------- */
+
+contract StakingRewards is ReentrancyGuard, Pausable, Ownable {
+    IERC20Minimal public stakingToken;
+    IERC20Minimal public rewardToken;
+
+    uint256 public totalStaked;
+    mapping(address => uint256) public balanceOf;
+
+    uint256 public rewardRatePerSecond; // reward tokens per second globally
+    uint256 public lastUpdateTime;
+    uint256 public rewardPerTokenStored;
+    mapping(address => uint256) public userRewardPerTokenPaid;
+    mapping(address => uint256) public rewards; // accrued but not claimed
+
+    event Staked(address indexed user, uint256 amount);
+    event Withdrawn(address indexed user, uint256 amount);
+    event RewardPaid(address indexed user, uint256 reward);
+
+    constructor(address staking, address reward) {
+        stakingToken = IERC20Minimal(staking);
+        rewardToken = IERC20Minimal(reward);
+        lastUpdateTime = block.timestamp;
+    }
+
+    modifier updateReward(address account) {
+        rewardPerTokenStored = rewardPerToken();
+        lastUpdateTime = block.timestamp;
+        if (account != address(0)) {
+            rewards[account] = earned(account);
+            userRewardPerTokenPaid[account] = rewardPerTokenStored;
+        }
+        _;
+    }
+
+    function rewardPerToken() public view returns (uint256) {
+        if (totalStaked == 0) return rewardPerTokenStored;
+        return rewardPerTokenStored + ((block.timestamp - lastUpdateTime) * rewardRatePerSecond * 1e18) / totalStaked;
+    }
+
+    function earned(address account) public view returns (uint256) {
+        return (balanceOf[account] * (rewardPerToken() - userRewardPerTokenPaid[account])) / 1e18 + rewards[account];
+    }
+
+    function stake(uint256 amount) external nonReentrant whenNotPaused updateReward(msg.sender) {
+        require(amount > 0, "Stake zero");
+        require(stakingToken.transferFrom(msg.sender, address(this), amount), "Stake token transfer failed");
+        balanceOf[msg.sender] += amount;
+        totalStaked += amount;
+        emit Staked(msg.sender, amount);
+    }
+
+    function withdraw(uint256 amount) external nonReentrant updateReward(msg.sender) {
+        require(balanceOf[msg.sender] >= amount, "Insufficient staked");
+        balanceOf[msg.sender] -= amount;
+        totalStaked -= amount;
+        require(stakingToken.transfer(msg.sender, amount), "Withdraw token send failed");
+        emit Withdrawn(msg.sender, amount);
+    }
+
+    function getReward() external nonReentrant updateReward(msg.sender) {
+        uint256 reward = rewards[msg.sender];
+        if (reward > 0) {
+            rewards[msg.sender] = 0;
+            require(rewardToken.transfer(msg.sender, reward), "Reward send failed");
+            emit RewardPaid(msg.sender, reward);
+        }
+    }
+
+    function notifyRewardAmount(uint256 reward, uint256 durationSeconds) external onlyOwner updateReward(address(0)) {
+        // simple linear rate for given duration
+        require(durationSeconds > 0, "Duration zero");
+        rewardRatePerSecond = reward / durationSeconds;
+        lastUpdateTime = block.timestamp;
+    }
+
+    function recoverERC20(address tokenAddress, uint256 tokenAmount) external onlyOwner {
+        IERC20Minimal(tokenAddress).transfer(owner, tokenAmount);
+    }
+
+    function pause() external onlyOwner { _pause(); }
+    function unpause() external onlyOwner { _unpause(); }
+}
+
+/* -------------------------------------------------------------------------
+   Vesting contract (token vesting with cliffs)
+   ------------------------------------------------------------------------- */
+
+contract TokenVesting is Ownable {
+    IERC20Minimal public token;
+    struct Vest {
+        uint256 totalAmount;
+        uint256 start;
+        uint256 cliff;
+        uint256 duration;
+        uint256 claimed;
+    }
+    mapping(address => Vest) public vestings;
+
+    event VestCreated(address indexed beneficiary, uint256 totalAmount, uint256 start, uint256 cliff, uint256 duration);
+    event Claimed(address indexed beneficiary, uint256 amount);
+
+    constructor(address tokenAddr) {
+        token = IERC20Minimal(tokenAddr);
+    }
+
+    function createVesting(address beneficiary, uint256 totalAmount, uint256 start, uint256 cliffDuration, uint256 duration) external onlyOwner {
+        require(vestings[beneficiary].totalAmount == 0, "Vest exists");
+        require(totalAmount > 0 && duration > 0, "Invalid amounts");
+        vestings[beneficiary] = Vest({
+            totalAmount: totalAmount,
+            start: start,
+            cliff: start + cliffDuration,
+            duration: duration,
+            claimed: 0
+        });
+        emit VestCreated(beneficiary, totalAmount, start, cliffDuration, duration);
+    }
+
+    function claim() external {
+        Vest storage v = vestings[msg.sender];
+        require(v.totalAmount > 0, "No vesting");
+        uint256 vested = _vestedAmount(v);
+        uint256 claimable = vested - v.claimed;
+        require(claimable > 0, "No claimable");
+        v.claimed += claimable;
+        require(token.transfer(msg.sender, claimable), "Token send failed");
+        emit Claimed(msg.sender, claimable);
+    }
+
+    function _vestedAmount(Vest memory v) internal view returns (uint256) {
+        if (block.timestamp < v.cliff) return 0;
+        if (block.timestamp >= v.start + v.duration) return v.totalAmount;
+        uint256 elapsed = block.timestamp - v.start;
+        return (v.totalAmount * elapsed) / v.duration;
+    }
+}
+
+/* -------------------------------------------------------------------------
+   Timelock contract — schedule a call, execute after delay
+   ------------------------------------------------------------------------- */
+
+contract SimpleTimelock is Ownable {
+    uint256 public minDelay;
+    mapping(bytes32 => bool) public queued;
+
+    event Queued(bytes32 txHash, address target, uint256 value, bytes data, uint256 eta);
+    event Cancelled(bytes32 txHash);
+    event Executed(bytes32 txHash, address target, uint256 value, bytes data);
+
+    constructor(uint256 delaySeconds) {
+        minDelay = delaySeconds;
+    }
+
+    function queueTransaction(address target, uint256 value, bytes calldata data, uint256 eta) external onlyOwner returns (bytes32) {
+        require(eta >= block.timestamp + minDelay, "Timelock: eta too small");
+        bytes32 txHash = keccak256(abi.encode(target, value, data, eta));
+        queued[txHash] = true;
+        emit Queued(txHash, target, value, data, eta);
+        return txHash;
+    }
+
+    function cancelTransaction(bytes32 txHash) external onlyOwner {
+        require(queued[txHash], "Timelock: not queued");
+        queued[txHash] = false;
+        emit Cancelled(txHash);
+    }
+
+    function executeTransaction(address target, uint256 value, bytes calldata data, uint256 eta) external payable onlyOwner returns (bytes memory) {
+        bytes32 txHash = keccak256(abi.encode(target, value, data, eta));
+        require(queued[txHash], "Timelock: not queued");
+        require(block.timestamp >= eta, "Timelock: too early");
+        queued[txHash] = false;
+        (bool success, bytes memory returnData) = target.call{value: value}(data);
+        require(success, "Timelock: execution reverted");
+        emit Executed(txHash, target, value, data);
+        return returnData;
+    }
+
+    receive() external payable {}
+}
+
+/* -------------------------------------------------------------------------
+   Very simple Multisig wallet (n-of-m)
+   - For demo; not gas-optimized. Owners set at creation, with confirmations mapping.
+   ------------------------------------------------------------------------- */
+
+contract SimpleMultisig {
+    address[] public owners;
+    uint256 public required; // confirmations required
+    mapping(bytes32 => mapping(address => bool)) public confirmations;
+    mapping(bytes32 => uint256) public confirmationCount;
+
+    event OwnerAdded(address owner);
+    event OwnerRemoved(address owner);
+    event TransactionSubmitted(bytes32 txId, address indexed to, uint256 value, bytes data);
+    event TransactionConfirmed(bytes32 txId, address owner);
+    event TransactionExecuted(bytes32 txId, address to, uint256 value);
+
+    constructor(address[] memory _owners, uint256 _required) {
+        require(_owners.length > 0 && _required > 0 && _required <= _owners.length, "Invalid multisig params");
+        owners = _owners;
+        required = _required;
+    }
+
+    modifier onlyOwner() {
+        bool isOwner = false;
+        for (uint256 i = 0; i < owners.length; i++) if (owners[i] == msg.sender) isOwner = true;
+        require(isOwner, "Multisig: not owner");
+        _;
+    }
+
+    function submitTransaction(address to, uint256 value, bytes calldata data) external onlyOwner returns (bytes32) {
+        bytes32 txId = keccak256(abi.encode(to, value, data, block.number, block.timestamp));
+        confirmations[txId][msg.sender] = true;
+        confirmationCount[txId] = 1;
+        emit TransactionSubmitted(txId, to, value, data);
+        emit TransactionConfirmed(txId, msg.sender);
+        return txId;
+    }
+
+    function confirmTransaction(bytes32 txId) external onlyOwner {
+        require(!confirmations[txId][msg.sender], "Already confirmed");
+        confirmations[txId][msg.sender] = true;
+        confirmationCount[txId] += 1;
+        emit TransactionConfirmed(txId, msg.sender);
+    }
+
+    function executeTransaction(bytes32 txId, address to, uint256 value, bytes calldata data) external onlyOwner returns (bool) {
+        require(confirmationCount[txId] >= required, "Not enough confirmations");
+        (bool ok, ) = to.call{value: value}(data);
+        require(ok, "Execution failed");
+        emit TransactionExecuted(txId, to, value);
+        return true;
+    }
+
+    receive() external payable {}
+}
+
+/* -------------------------------------------------------------------------
+   DAO: simple proposals and voting with token-weighted votes
+   - Proposals created, voting period, quorum, execution via timelock optionally
+   ------------------------------------------------------------------------- */
+
+contract SimpleDAO is ReentrancyGuard {
+    struct Proposal {
+        address proposer;
+        string description;
+        uint256 start;
+        uint256 end;
+        uint256 forVotes;
+        uint256 againstVotes;
+        bool executed;
+        address target;
+        bytes data;
+    }
+    LongERC20 public governanceToken;
+    mapping(uint256 => Proposal) public proposals;
+    uint256 public proposalCount;
+    uint256 public votingPeriod = 3 days;
+    uint256 public quorum = 1000 * 1e18; // example
+
+    event ProposalCreated(uint256 id, address proposer);
+    event VoteCast(uint256 id, address voter, bool support, uint256 weight);
+    event ProposalExecuted(uint256 id);
+
+    constructor(address token) {
+        governanceToken = LongERC20(token);
+    }
+
+    function createProposal(string memory description, address target, bytes memory data) external returns (uint256) {
+        proposalCount++;
+        proposals[proposalCount] = Proposal({
+            proposer: msg.sender,
+            description: description,
+            start: block.timestamp,
+            end: block.timestamp + votingPeriod,
+            forVotes: 0,
+            againstVotes: 0,
+            executed: false,
+            target: target,
+            data: data
+        });
+        emit ProposalCreated(proposalCount, msg.sender);
+        return proposalCount;
+    }
+
+    function castVote(uint256 id, bool support) external {
+        Proposal storage p = proposals[id];
+        require(block.timestamp >= p.start && block.timestamp <= p.end, "Voting closed");
+        uint256 weight = governanceToken.balanceOf(msg.sender);
+        require(weight > 0, "No voting power");
+        if (support) p.forVotes += weight;
+        else p.againstVotes += weight
